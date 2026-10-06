@@ -1,5 +1,6 @@
 """业务模块说明。"""
 
+from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
@@ -43,6 +44,15 @@ class SignalTradeRequest(BaseModel):
     signal_strength: float
     price: float
     position_ratio: float = 0.1
+
+
+class TradeReportRequest(BaseModel):
+    """成交回报（券商/交易所推送）。"""
+    trade_id: str
+    quantity: int
+    price: float
+    traded_at: Optional[datetime] = None
+    commission: Optional[float] = None
 
 
 @router.post("/connect")
@@ -116,6 +126,43 @@ async def cancel_order(order_id: str):
     return trading_service.cancel_order(order_id)
 
 
+@router.post("/orders/{order_id}/trades")
+async def report_trade(order_id: str, request: TradeReportRequest):
+    """接收成交回报；重复回报幂等，迟到回报在撤单余量内承接。"""
+    return trading_service.report_trade(
+        order_id=order_id,
+        trade_id=request.trade_id,
+        quantity=request.quantity,
+        price=request.price,
+        traded_at=request.traded_at,
+        commission=request.commission,
+    )
+
+
+@router.get("/orders/{order_id}/trades")
+async def get_order_trades(order_id: str):
+    """订单的全部成交分片（保留每笔原始价格与时间）。"""
+    return {"order_id": order_id, "trades": trading_service.get_order_trades(order_id)}
+
+
+@router.get("/trades")
+async def get_trades(
+    order_id: Optional[str] = Query(default=None, description="订单编号"),
+    stock_code: Optional[str] = Query(default=None, description="股票代码"),
+    trade_date: Optional[str] = Query(default=None, description="成交日期 YYYY-MM-DD"),
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: Optional[str] = Query(default=None, description="上一页返回的 next_cursor"),
+):
+    """成交流水键集分页查询。"""
+    return trading_service.query_trades(
+        order_id=order_id,
+        stock_code=stock_code,
+        trade_date=trade_date,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
 @router.get("/orders/{order_id}")
 async def get_order(order_id: str):
     """业务模块说明。"""
@@ -126,9 +173,37 @@ async def get_order(order_id: str):
 async def get_orders(
     stock_code: Optional[str] = Query(default=None, description="股票代码"),
     status: Optional[str] = Query(default=None, description="订单状态"),
+    trade_date: Optional[str] = Query(default=None, description="交易日期 YYYY-MM-DD"),
+    limit: int = Query(default=500, ge=1, le=500),
+    cursor: Optional[str] = Query(default=None, description="分页游标"),
 ):
-    """业务模块说明。"""
-    return {"orders": trading_service.get_orders(stock_code, status)}
+    """订单键集分页查询；未翻页时兼容返回 orders 列表。"""
+    if cursor or limit != 500:
+        page = trading_service.query_orders(
+            stock_code=stock_code,
+            status=status,
+            trade_date=trade_date,
+            limit=limit,
+            cursor=cursor,
+        )
+        return {
+            "orders": page["items"],
+            "next_cursor": page["next_cursor"],
+            "has_more": page["has_more"],
+        }
+    return {"orders": trading_service.get_orders(stock_code, status, trade_date)}
+
+
+@router.post("/rollover")
+async def rollover_trading_day():
+    """跨日收盘：撤销全部在途单，成交分片按原成交日保留。"""
+    return trading_service.rollover_trading_day()
+
+
+@router.get("/reconcile")
+async def reconcile():
+    """账户汇总与订单/成交明细对账。"""
+    return trading_service.reconcile()
 
 
 @router.get("/quote/{stock_code}")

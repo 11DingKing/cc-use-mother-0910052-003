@@ -16,6 +16,7 @@ from app.trading.base import (
     RiskManager,
 )
 from app.trading.simulation_adapter import SimulationAdapter
+from app.trading.settlement import SettlementError, TradeReport
 from app.trading.vnpy_adapter import VnpyAdapter
 from app.services.analysis_service import AnalysisService
 from app.middleware.exception_handler import AppException
@@ -56,11 +57,19 @@ class TradingService:
     
     def connect(self, adapter_type: str = "simulation", config: Optional[Dict] = None) -> bool:
         """业务模块说明。"""
+        config = config or {}
         if adapter_type == "vnpy":
-            self.adapter = VnpyAdapter(config or {})
+            self.adapter = VnpyAdapter(config)
         else:
-            self.adapter = SimulationAdapter(config)
-        
+            adapter_config = dict(config)
+            # 传入 db_url 时启用 SQLite 持久化，重启后重放成交分片恢复账本
+            db_url = adapter_config.pop("db_url", None)
+            if db_url:
+                from app.trading.repository import SqliteTradeRepository
+
+                adapter_config["repository"] = SqliteTradeRepository(db_url)
+            self.adapter = SimulationAdapter(adapter_config)
+
         return self.adapter.connect()
     
     def disconnect(self) -> None:
@@ -140,10 +149,10 @@ class TradingService:
                 stock_code=stock_code,
             )
         
-        # 记录交易金额
-        if result.status == OrderStatus.FILLED:
+        # 记录已成交部分的交易金额（支持部分成交）
+        if result.filled_quantity > 0 and result.filled_price is not None:
             self.risk_manager.record_trade(result.filled_price * result.filled_quantity)
-        
+
         return result.to_dict()
     
     def sell(
@@ -195,23 +204,78 @@ class TradingService:
         return result.to_dict()
     
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """业务模块说明。"""
+        """业务模块说明。部分成交后撤单只释放剩余数量，成交分片原样保留。"""
         order = self.adapter.get_order(order_id)
         if not order:
             raise TradingException("订单不存在", order_id=order_id)
-        
-        if order.status not in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
+
+        if order.status not in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIAL_FILLED,
+        ):
             raise TradingException(
                 f"订单状态为 {order.status.value}，无法撤销",
                 order_id=order_id,
             )
-        
+
         success = self.adapter.cancel_order(order_id)
         if not success:
             raise TradingException("撤单失败", order_id=order_id)
-        
+
         order = self.adapter.get_order(order_id)
         return order.to_dict()
+
+    def report_trade(
+        self,
+        order_id: str,
+        trade_id: str,
+        quantity: int,
+        price: float,
+        traded_at: Optional[datetime] = None,
+        commission: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """推送成交回报；重复 trade_id 幂等，迟到回报在撤单余量内承接。"""
+        if self.adapter.get_order(order_id) is None:
+            raise TradingException("订单不存在", order_id=order_id)
+
+        report = TradeReport(
+            order_id=order_id,
+            trade_id=trade_id,
+            quantity=quantity,
+            price=Decimal(str(price)),
+            traded_at=traded_at,
+            commission=Decimal(str(commission)) if commission is not None else None,
+        )
+        try:
+            if hasattr(self.adapter, "report_trade"):
+                trade, is_new = self.adapter.report_trade(report)
+            else:
+                raise TradingException("当前交易通道不支持成交回报", order_id=order_id)
+        except SettlementError as exc:
+            raise TradingException(str(exc), order_id=order_id)
+
+        return {"trade": trade.to_dict(), "is_new": is_new}
+
+    def get_order_trades(self, order_id: str) -> List[Dict[str, Any]]:
+        """订单的每一笔成交分片（原始价格与时间）。"""
+        order = self.adapter.get_order(order_id)
+        if not order:
+            raise TradingException("订单不存在", order_id=order_id)
+        return [t.to_dict() for t in order.trades]
+
+    def rollover_trading_day(self) -> Dict[str, Any]:
+        """跨日收盘：撤销全部在途单，保留当日及历史成交分片。"""
+        if not hasattr(self.adapter, "rollover_trading_day"):
+            raise TradingException("当前交易通道不支持收盘处理")
+        closed = self.adapter.rollover_trading_day()
+        return {"cancelled_count": len(closed), "order_ids": [o.order_id for o in closed]}
+
+    def reconcile(self) -> Dict[str, Any]:
+        """账户汇总与订单/成交明细对账。"""
+        if not hasattr(self.adapter, "reconcile"):
+            raise TradingException("当前交易通道不支持对账")
+        return self.adapter.reconcile()
     
     def get_order(self, order_id: str) -> Dict[str, Any]:
         """业务模块说明。"""
@@ -224,11 +288,56 @@ class TradingService:
         self,
         stock_code: Optional[str] = None,
         status: Optional[str] = None,
+        trade_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """业务模块说明。"""
         order_status = OrderStatus(status) if status else None
-        orders = self.adapter.get_orders(stock_code, order_status)
-        return [o.to_dict() for o in orders]
+        page = self.adapter.get_orders(
+            stock_code=stock_code,
+            status=order_status,
+            trade_date=trade_date,
+            limit=500,
+        )
+        return [o.to_dict() for o in page.items]
+
+    def query_orders(
+        self,
+        stock_code: Optional[str] = None,
+        status: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """订单键集分页查询（排序稳定，翻页不重不漏）。"""
+        order_status = OrderStatus(status) if status else None
+        page = self.adapter.get_orders(
+            stock_code=stock_code,
+            status=order_status,
+            trade_date=trade_date,
+            limit=limit,
+            cursor=cursor,
+        )
+        return page.to_dict()
+
+    def query_trades(
+        self,
+        order_id: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """成交流水键集分页查询。"""
+        if not hasattr(self.adapter, "get_trades"):
+            raise TradingException("当前交易通道不支持成交查询")
+        page = self.adapter.get_trades(
+            order_id=order_id,
+            stock_code=stock_code,
+            trade_date=trade_date,
+            limit=limit,
+            cursor=cursor,
+        )
+        return page.to_dict()
     
     def get_quote(self, stock_code: str) -> Dict[str, Any]:
         """业务模块说明。"""

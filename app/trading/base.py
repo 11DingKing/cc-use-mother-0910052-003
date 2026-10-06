@@ -37,6 +37,55 @@ class OrderStatus(Enum):
 
 
 @dataclass
+class Trade:
+    """成交流水（订单的一次成交分片）。
+
+    每一笔回报对应一条不可变流水，trade_id 为全局幂等键；
+    价格、费用与成交时间保留回报原始值，是结算入账的唯一凭证。
+    """
+    trade_id: str
+    order_id: str
+    stock_code: str
+    side: "OrderSide"
+    quantity: int                              # 本次成交数量
+    price: Decimal                             # 本次成交原始价格
+    commission: Decimal                        # 本次成交费用（含印花税等）
+    traded_at: datetime                        # 成交时间（交易所回报原始时间）
+    settled: bool = False                      # 是否已完成账户过账
+    created_at: Optional[datetime] = None      # 入账时间
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.now()
+
+    @property
+    def trade_date(self) -> datetime.date:
+        """成交所属交易日。"""
+        return self.traded_at.date()
+
+    @property
+    def amount(self) -> Decimal:
+        """本次成交金额。"""
+        return self.price * self.quantity
+
+    def to_dict(self) -> Dict:
+        return {
+            "trade_id": self.trade_id,
+            "order_id": self.order_id,
+            "stock_code": self.stock_code,
+            "side": self.side.value,
+            "quantity": self.quantity,
+            "price": float(self.price),
+            "amount": float(self.amount),
+            "commission": float(self.commission),
+            "traded_at": self.traded_at.isoformat(),
+            "trade_date": self.trade_date.isoformat(),
+            "settled": self.settled,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+@dataclass
 class Order:
     """业务模块说明。"""
     order_id: str
@@ -48,19 +97,57 @@ class Order:
     stop_price: Optional[Decimal] = None  # 止损触发价
     status: OrderStatus = OrderStatus.PENDING
     filled_quantity: int = 0
-    filled_price: Optional[Decimal] = None
-    commission: Decimal = Decimal("0")
+    filled_price: Optional[Decimal] = None   # 已成交部分的成交量加权均价
+    commission: Decimal = Decimal("0")       # 已成交分片费用累计
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     error_message: Optional[str] = None
-    
+
+    # 分片成交与撤单结算
+    trades: List["Trade"] = field(default_factory=list)
+    cancelled_quantity: int = 0              # 撤单释放的未成交数量
+    cancelled_at: Optional[datetime] = None
+
     # 策略相关
     strategy_name: Optional[str] = None
     signal_type: Optional[str] = None     # 买卖点类型，如 BUY_1, SELL_2
     signal_strength: float = 0.0
-    
-    def to_dict(self) -> Dict:
-        return {
+
+    @property
+    def remaining_quantity(self) -> int:
+        """未成交且未撤销的剩余数量。"""
+        return self.quantity - self.filled_quantity - self.cancelled_quantity
+
+    @property
+    def avg_filled_price(self) -> Optional[Decimal]:
+        """已成交部分成交量加权均价。"""
+        return self.filled_price
+
+    @property
+    def filled_amount(self) -> Decimal:
+        """已成交总金额（各分片原始价格求和）。"""
+        return sum((t.amount for t in self.trades), Decimal("0"))
+
+    @property
+    def is_active(self) -> bool:
+        """订单是否仍可成交或撤销。"""
+        return self.status in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIAL_FILLED,
+        )
+
+    @property
+    def trade_date(self) -> datetime.date:
+        """订单所属交易日。"""
+        return self.created_at.date()
+
+    def get_trade(self, trade_id: str) -> Optional["Trade"]:
+        """按幂等键取回成交分片。"""
+        return next((t for t in self.trades if t.trade_id == trade_id), None)
+
+    def to_dict(self, include_trades: bool = True) -> Dict:
+        data = {
             "order_id": self.order_id,
             "stock_code": self.stock_code,
             "side": self.side.value,
@@ -71,6 +158,11 @@ class Order:
             "status": self.status.value,
             "filled_quantity": self.filled_quantity,
             "filled_price": float(self.filled_price) if self.filled_price else None,
+            "avg_filled_price": float(self.filled_price) if self.filled_price else None,
+            "filled_amount": float(self.filled_amount),
+            "remaining_quantity": self.remaining_quantity,
+            "cancelled_quantity": self.cancelled_quantity,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
             "commission": float(self.commission),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -79,6 +171,9 @@ class Order:
             "signal_type": self.signal_type,
             "signal_strength": self.signal_strength,
         }
+        if include_trades:
+            data["trades"] = [t.to_dict() for t in self.trades]
+        return data
 
 
 @dataclass
@@ -213,7 +308,10 @@ class TradingAdapter(ABC):
         self,
         stock_code: Optional[str] = None,
         status: Optional[OrderStatus] = None,
-    ) -> List[Order]:
+        trade_date: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ):
         """业务模块说明。"""
         pass
     

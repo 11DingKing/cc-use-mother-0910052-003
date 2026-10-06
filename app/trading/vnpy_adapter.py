@@ -334,17 +334,27 @@ class VnpyAdapter(TradingAdapter):
         self,
         stock_code: Optional[str] = None,
         status: Optional[OrderStatus] = None,
-    ) -> List[Order]:
-        """业务模块说明。"""
+        trade_date: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ):
+        """业务模块说明。未接入结算账本的网关以首页形式返回全部订单。"""
+        from app.trading.settlement import Page
+
         orders = list(self._orders.values())
-        
+
         if stock_code:
             orders = [o for o in orders if o.stock_code == stock_code]
-        
+
         if status:
             orders = [o for o in orders if o.status == status]
-        
-        return orders
+
+        if trade_date:
+            orders = [o for o in orders if o.created_at.date().isoformat() == trade_date]
+
+        orders.sort(key=lambda o: (o.created_at, o.order_id), reverse=True)
+        page_items = orders[: max(1, min(limit, 500))]
+        return Page(items=page_items, next_cursor=None, has_more=False)
     
     def get_quote(self, stock_code: str) -> Optional[Dict]:
         """业务模块说明。"""
