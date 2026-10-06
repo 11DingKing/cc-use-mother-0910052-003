@@ -389,10 +389,11 @@ class TestTradingService:
         """业务模块说明。"""
         service.buy("000001", 100, 10.0)
         service.buy("000001", 200, 10.0)
-        
-        orders = service.get_orders()
-        
-        assert len(orders) == 2
+
+        page = service.get_orders()
+
+        assert page["total"] == 2
+        assert len(page["items"]) == 2
     
     def test_auto_trade_disabled(self, service):
         """业务模块说明。"""

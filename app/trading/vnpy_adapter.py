@@ -13,6 +13,7 @@ from app.trading.base import (
     OrderSide,
     Position,
     Account,
+    Trade,
 )
 
 logger = logging.getLogger(__name__)
@@ -334,17 +335,60 @@ class VnpyAdapter(TradingAdapter):
         self,
         stock_code: Optional[str] = None,
         status: Optional[OrderStatus] = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> List[Order]:
         """业务模块说明。"""
         orders = list(self._orders.values())
-        
+
         if stock_code:
             orders = [o for o in orders if o.stock_code == stock_code]
-        
+
         if status:
             orders = [o for o in orders if o.status == status]
-        
-        return orders
+
+        orders.sort(key=lambda o: (o.created_at, o.order_id), reverse=True)
+        return orders[offset : offset + limit]
+
+    def get_trades(
+        self,
+        order_id: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Trade]:
+        """vn.py 真实网关的成交分片应从成交回调获取；内存兜底返回订单分片。"""
+        orders = (
+            [self._orders[order_id]]
+            if order_id and order_id in self._orders
+            else list(self._orders.values())
+        )
+        trades: List[Trade] = []
+        for order in orders:
+            if stock_code and order.stock_code != stock_code:
+                continue
+            for trade in getattr(order, "trades", []):
+                if trade_date and trade.trade_date.isoformat() != trade_date:
+                    continue
+                trades.append(trade)
+        trades.sort(key=lambda t: (t.trade_time, t.sequence, t.trade_id))
+        return trades[offset : offset + limit]
+
+    def process_trade_report(
+        self,
+        order_id: str,
+        trade_id: str,
+        quantity: int,
+        price: Decimal,
+        trade_time: Optional[datetime] = None,
+    ) -> Trade:
+        """真实网关成交回报处理未启用，请接入 on_trade 事件。"""
+        raise NotImplementedError("VnpyAdapter 请通过网关 on_trade 回调处理成交回报")
+
+    def expire_day_orders(self, reason: str = "收盘作废") -> List[Order]:
+        """真实网关的收盘作废以交易所状态为准，本地不主动改写。"""
+        return []
     
     def get_quote(self, stock_code: str) -> Optional[Dict]:
         """业务模块说明。"""

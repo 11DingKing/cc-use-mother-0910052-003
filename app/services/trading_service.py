@@ -14,9 +14,11 @@ from app.trading.base import (
     Position,
     Account,
     RiskManager,
+    Trade,
 )
 from app.trading.simulation_adapter import SimulationAdapter
 from app.trading.vnpy_adapter import VnpyAdapter
+from app.trading.settlement import SettlementError
 from app.services.analysis_service import AnalysisService
 from app.middleware.exception_handler import AppException
 
@@ -93,6 +95,7 @@ class TradingService:
         order_type: str = "limit",
         signal_type: Optional[str] = None,
         signal_strength: float = 0.0,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """业务模块说明。"""
         # 数量校验
@@ -101,13 +104,13 @@ class TradingService:
                 "买入数量必须是100的整数倍",
                 stock_code=stock_code,
             )
-        
+
         # 构建订单
         ot = OrderType.LIMIT if order_type == "limit" else OrderType.MARKET
-        
+
         if ot == OrderType.LIMIT and price is None:
             raise TradingException("限价单必须指定价格", stock_code=stock_code)
-        
+
         order = Order(
             order_id=self.adapter._generate_order_id(),
             stock_code=stock_code,
@@ -117,33 +120,35 @@ class TradingService:
             price=Decimal(str(price)) if price else None,
             signal_type=signal_type,
             signal_strength=signal_strength,
+            client_order_id=client_order_id,
         )
-        
+
         # 风控检查
         account = self.adapter.get_account()
         positions = self.adapter.get_positions()
-        
+
         passed, reason = self.risk_manager.check_order(order, account, positions)
         if not passed:
             raise TradingException(
                 f"风控检查未通过: {reason}",
                 stock_code=stock_code,
             )
-        
+
         # 执行下单
         result = self.adapter.place_order(order)
-        
+
         if result.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
             raise TradingException(
                 f"下单失败: {result.error_message}",
                 order_id=result.order_id,
                 stock_code=stock_code,
             )
-        
-        # 记录交易金额
-        if result.status == OrderStatus.FILLED:
-            self.risk_manager.record_trade(result.filled_price * result.filled_quantity)
-        
+
+        # 记录交易金额（按已成交分片累计，部分成交也计入）
+        if result.filled_quantity > 0:
+            amount = result.average_fill_price * result.filled_quantity
+            self.risk_manager.record_trade(amount)
+
         return result.to_dict()
     
     def sell(
@@ -154,6 +159,7 @@ class TradingService:
         order_type: str = "limit",
         signal_type: Optional[str] = None,
         signal_strength: float = 0.0,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """业务模块说明。"""
         # 持仓检查
@@ -164,13 +170,13 @@ class TradingService:
                 f"可用持仓不足，需要 {quantity}，可用 {available}",
                 stock_code=stock_code,
             )
-        
+
         # 构建订单
         ot = OrderType.LIMIT if order_type == "limit" else OrderType.MARKET
-        
+
         if ot == OrderType.LIMIT and price is None:
             raise TradingException("限价单必须指定价格", stock_code=stock_code)
-        
+
         order = Order(
             order_id=self.adapter._generate_order_id(),
             stock_code=stock_code,
@@ -180,55 +186,153 @@ class TradingService:
             price=Decimal(str(price)) if price else None,
             signal_type=signal_type,
             signal_strength=signal_strength,
+            client_order_id=client_order_id,
         )
-        
+
         # 执行下单
         result = self.adapter.place_order(order)
-        
+
         if result.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
             raise TradingException(
                 f"下单失败: {result.error_message}",
                 order_id=result.order_id,
                 stock_code=stock_code,
             )
-        
+
+        if result.filled_quantity > 0:
+            amount = result.average_fill_price * result.filled_quantity
+            self.risk_manager.record_trade(amount)
+
         return result.to_dict()
-    
+
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """业务模块说明。"""
+        """撤单：部分成交后只释放剩余数量，已成交分片全部保留。"""
         order = self.adapter.get_order(order_id)
         if not order:
             raise TradingException("订单不存在", order_id=order_id)
-        
-        if order.status not in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
+
+        if not order.status.is_active:
             raise TradingException(
                 f"订单状态为 {order.status.value}，无法撤销",
                 order_id=order_id,
             )
-        
+
         success = self.adapter.cancel_order(order_id)
         if not success:
             raise TradingException("撤单失败", order_id=order_id)
-        
+
         order = self.adapter.get_order(order_id)
         return order.to_dict()
-    
+
     def get_order(self, order_id: str) -> Dict[str, Any]:
         """业务模块说明。"""
         order = self.adapter.get_order(order_id)
         if not order:
             raise TradingException("订单不存在", order_id=order_id)
         return order.to_dict()
-    
+
     def get_orders(
         self,
         stock_code: Optional[str] = None,
         status: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """业务模块说明。"""
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """分页查询订单，返回明细与总数，翻页结果稳定。"""
         order_status = OrderStatus(status) if status else None
-        orders = self.adapter.get_orders(stock_code, order_status)
-        return [o.to_dict() for o in orders]
+        limit = self._clamp_page_size(limit)
+        orders = self.adapter.get_orders(stock_code, order_status, limit, offset)
+        total = self._count_orders(stock_code, order_status)
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [o.to_dict() for o in orders],
+        }
+
+    def _count_orders(
+        self, stock_code: Optional[str], status: Optional[OrderStatus]
+    ) -> int:
+        counter = getattr(self.adapter, "count_orders", None)
+        if counter is not None:
+            return counter(stock_code, status)
+        return len(self.adapter.get_orders(stock_code, status, limit=10**9))
+
+    @staticmethod
+    def _clamp_page_size(limit: int) -> int:
+        if limit is None or limit <= 0:
+            return 50
+        return min(limit, 500)
+
+    def get_trades(
+        self,
+        order_id: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """分页查询成交分片（每一笔成交的原始价格、时间与费用）。"""
+        limit = self._clamp_page_size(limit)
+        trades = self.adapter.get_trades(
+            order_id, stock_code, trade_date, limit, offset
+        )
+        counter = getattr(self.adapter, "count_trades", None)
+        total = (
+            counter(order_id, stock_code, trade_date)
+            if counter is not None
+            else len(self.adapter.get_trades(order_id, stock_code, trade_date,
+                                            limit=10**9))
+        )
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [t.to_dict() for t in trades],
+        }
+
+    def report_trade(
+        self,
+        order_id: str,
+        trade_id: str,
+        quantity: int,
+        price: float,
+        trade_time: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """外部成交回报入口：重复/迟到/超量回报均有稳定结果。"""
+        parsed_time = datetime.fromisoformat(trade_time) if trade_time else None
+        try:
+            trade = self.adapter.process_trade_report(
+                order_id=order_id,
+                trade_id=trade_id,
+                quantity=quantity,
+                price=Decimal(str(price)),
+                trade_time=parsed_time,
+            )
+        except SettlementError as exc:
+            raise TradingException(str(exc), order_id=order_id)
+        except NotImplementedError:
+            raise TradingException("当前交易适配器不支持外部成交回报")
+        return trade.to_dict()
+
+    def settle_day_end(self, reason: str = "收盘作废") -> Dict[str, Any]:
+        """跨日收盘：作废仍活跃的订单并释放剩余冻结。"""
+        expire = getattr(self.adapter, "expire_day_orders", None)
+        if expire is None:
+            return {"expired_count": 0, "orders": []}
+        expired = expire(reason)
+        return {
+            "expired_count": len(expired),
+            "orders": [o.to_dict() for o in expired],
+        }
+
+    def reconcile(self) -> Dict[str, Any]:
+        """账户汇总与订单/成交明细交叉核对。"""
+        reconciler = getattr(self.adapter, "reconcile", None)
+        if reconciler is None:
+            return {"balanced": True, "problems": []}
+        problems = reconciler()
+        return {"balanced": not problems, "problems": problems}
     
     def get_quote(self, stock_code: str) -> Dict[str, Any]:
         """业务模块说明。"""
